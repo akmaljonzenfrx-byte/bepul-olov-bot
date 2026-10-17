@@ -22,6 +22,10 @@ ENV_ADMINS = {int(x) for x in re.findall(r"\d+", os.getenv("ADMIN_IDS", ""))}
 GROQ_KEY = os.getenv("GROQ_API_KEY", "")
 OR_KEY = os.getenv("OPENROUTER_API_KEY", "")
 DB_PATH = os.getenv("DB_PATH", "bot.db")
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+IS_PG = DATABASE_URL.startswith("postgres")
+if IS_PG:
+    import psycopg2
 PORT = int(os.getenv("PORT", "8080"))
 TZ = timezone(timedelta(hours=5))  # Toshkent
 HTML = ParseMode.HTML
@@ -56,34 +60,119 @@ CREATE TABLE IF NOT EXISTS leagues(id INTEGER PRIMARY KEY AUTOINCREMENT, name TE
 CREATE TABLE IF NOT EXISTS partner_ads(user_id INTEGER PRIMARY KEY, mode TEXT, ts INTEGER);
 """
 db = None
+PGSCHEMA = (SCHEMA.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "BIGSERIAL PRIMARY KEY")
+            .replace("INTEGER", "BIGINT").replace("REAL", "DOUBLE PRECISION"))
+IDTABLES = {"orders", "withdrawals", "prizes", "tasks", "items", "leagues", "channels", "promo_uses"}
+
+
+class Row:
+    def __init__(self, keys, vals):
+        self._v = list(vals)
+        self._m = dict(zip(keys, self._v))
+
+    def __getitem__(self, i):
+        return self._v[i] if isinstance(i, int) else self._m[i]
+
+
+class Cur:
+    def __init__(self, out=None, lastrowid=None):
+        self._r = out or []
+        self.lastrowid = lastrowid
+
+    def fetchone(self):
+        return self._r[0] if self._r else None
+
+    def fetchall(self):
+        return self._r
+
+
+class PGDB:
+    """sqlite3 ga o'xshash Postgres qobig'i (Neon)."""
+
+    def __init__(self, url):
+        self.url = url
+        self.conn = None
+        self._open()
+
+    def _open(self):
+        self.conn = psycopg2.connect(self.url, connect_timeout=20)
+        self.conn.autocommit = True
+
+    def execute(self, sql, args=()):
+        sql = sql.replace("?", "%s")
+        m = re.match(r"\s*INSERT INTO (\w+)", sql, re.I)
+        ret = bool(m and m.group(1).lower() in IDTABLES and "returning" not in sql.lower())
+        if ret:
+            sql += " RETURNING id"
+        for attempt in (0, 1):
+            try:
+                cur = self.conn.cursor()
+                cur.execute(sql, tuple(args))
+                break
+            except (psycopg2.OperationalError, psycopg2.InterfaceError):
+                if attempt:
+                    raise
+                try:
+                    self.conn.close()
+                except Exception:
+                    pass
+                self._open()
+        out = []
+        if cur.description:
+            keys = [d[0] for d in cur.description]
+            out = [Row(keys, r) for r in cur.fetchall()]
+        cur.close()
+        lid = None
+        if ret and out:
+            lid, out = out[0]["id"], []
+        return Cur(out, lid)
+
+    def commit(self):
+        pass
+
+    def close(self):
+        try:
+            self.conn.close()
+        except Exception:
+            pass
 
 
 def connect():
     global db
-    db = sqlite3.connect(DB_PATH, check_same_thread=False)
-    db.row_factory = sqlite3.Row
-    db.executescript(SCHEMA)
-    if not db.execute("SELECT 1 FROM prizes").fetchone():
-        db.executemany("INSERT INTO prizes(amount,weight) VALUES(?,?)",
-                       [(0, 20), (1, 45), (2, 20), (3, 8), (5, 5), (10, 2)])
-    if not db.execute("SELECT 1 FROM leagues").fetchone():
-        db.executemany("INSERT INTO leagues(name,emoji,min_points) VALUES(?,?,?)",
-                       [("Bronze", "🥉", 0), ("Silver", "🥈", 50), ("Gold", "🥇", 150), ("Platinum", "💠", 400),
-                        ("Diamond", "💎", 800), ("Heroic", "🔥", 1500), ("Grandmaster", "👑", 3000)])
-    if not db.execute("SELECT 1 FROM items").fetchone():
-        db.executemany("INSERT INTO items(cat,name,descr,price) VALUES(?,?,?,?)", [
-            ("direct", "💎 100 Diamond", "O'yin ichidagi 100 ta diamond FF ID ga yuboriladi.", 100),
-            ("direct", "💎 310 Diamond", "O'yin ichidagi 310 ta diamond FF ID ga yuboriladi.", 300),
-            ("direct", "💎 520 Diamond", "O'yin ichidagi 520 ta diamond FF ID ga yuboriladi.", 500),
-            ("pack", "🎁 Haftalik obuna", "Haftalik Airdrop obunasi.", 250),
-            ("pack", "🎁 Oylik obuna", "Oylik Airdrop obunasi.", 800),
-            ("emote", "🕺 Emote: Raqs", "Mashhur emotsiya FF ID ga beriladi.", 150),
-            ("emote", "🕺 Emote: G'alaba", "G'alaba emotsiyasi.", 200),
-            ("skin", "🛡 Stenka: Olov", "Olovli stenka skini.", 120),
-            ("skin", "🛡 Skin: Qora Ritsar", "Qimmatbaho kiyim skini.", 400),
-            ("service", "📢 Kanalingizni reklama qilish", "Bot foydalanuvchilariga kanalingiz reklamasi.", 100),
-            ("service", "🎬 Video montaj", "Free Fire videongiz uchun professional montaj.", 300),
-            ("service", "🖼 Banner / Thumbnail dizayn", "YouTube kanal uchun banner va thumbnail.", 150)])
+    if IS_PG:
+        if db is None:
+            db = PGDB(DATABASE_URL)
+        for stmt in PGSCHEMA.split(";"):
+            if stmt.strip():
+                db.execute(stmt)
+    else:
+        db = sqlite3.connect(DB_PATH, check_same_thread=False)
+        db.row_factory = sqlite3.Row
+        db.executescript(SCHEMA)
+    if not db.execute("SELECT 1 FROM settings WHERE k='_seeded'").fetchone():
+        if not db.execute("SELECT 1 FROM prizes").fetchone():
+            for r in [(0, 20), (1, 45), (2, 20), (3, 8), (5, 5), (10, 2)]:
+                db.execute("INSERT INTO prizes(amount,weight) VALUES(?,?)", r)
+        if not db.execute("SELECT 1 FROM leagues").fetchone():
+            for r in [("Bronze", "🥉", 0), ("Silver", "🥈", 50), ("Gold", "🥇", 150), ("Platinum", "💠", 400),
+                      ("Diamond", "💎", 800), ("Heroic", "🔥", 1500), ("Grandmaster", "👑", 3000)]:
+                db.execute("INSERT INTO leagues(name,emoji,min_points) VALUES(?,?,?)", r)
+        if not db.execute("SELECT 1 FROM items").fetchone():
+            for r in [
+                ("direct", "💎 100 Diamond", "O'yin ichidagi 100 ta diamond FF ID ga yuboriladi.", 100),
+                ("direct", "💎 310 Diamond", "O'yin ichidagi 310 ta diamond FF ID ga yuboriladi.", 300),
+                ("direct", "💎 520 Diamond", "O'yin ichidagi 520 ta diamond FF ID ga yuboriladi.", 500),
+                ("pack", "🎁 Haftalik obuna", "Haftalik Airdrop obunasi.", 250),
+                ("pack", "🎁 Oylik obuna", "Oylik Airdrop obunasi.", 800),
+                ("emote", "🕺 Emote: Raqs", "Mashhur emotsiya FF ID ga beriladi.", 150),
+                ("emote", "🕺 Emote: G'alaba", "G'alaba emotsiyasi.", 200),
+                ("skin", "🛡 Stenka: Olov", "Olovli stenka skini.", 120),
+                ("skin", "🛡 Skin: Qora Ritsar", "Qimmatbaho kiyim skini.", 400),
+                ("service", "📢 Kanalingizni reklama qilish", "Bot foydalanuvchilariga kanalingiz reklamasi.", 100),
+                ("service", "🎬 Video montaj", "Free Fire videongiz uchun professional montaj.", 300),
+                ("service", "🖼 Banner / Thumbnail dizayn", "YouTube kanal uchun banner va thumbnail.", 150)]:
+                db.execute("INSERT INTO items(cat,name,descr,price) VALUES(?,?,?,?)", r)
+        db.execute("INSERT INTO settings(k,v) VALUES('_seeded','1')")
     db.commit()
 
 
@@ -1323,6 +1412,10 @@ async def cb_a(update, ctx, a):
             await q.message.reply_text(ord_text(o["id"]), parse_mode=HTML, reply_markup=ord_kb(o["id"]))
         for w in ws:
             await q.message.reply_text(wd_text(w["id"]), parse_mode=HTML, reply_markup=wd_kb(w["id"]))
+    elif s == "bk" and IS_PG:
+        await q.answer("✅ Postgres (Neon) ishlatilmoqda — ma'lumotlar doim saqlanadi, backup shart emas.", show_alert=True)
+    elif s == "rs" and IS_PG:
+        await q.answer("Postgres rejimida restore kerak emas.", show_alert=True)
     elif s == "bk":
         await q.answer("Tayyorlanmoqda...")
         path = tempfile.mktemp(suffix=".db")
@@ -1428,7 +1521,7 @@ async def st_adm_uval(update, ctx, s, t):
     if s["f"] == "bal":
         credit(s["uid"], n)
     else:
-        ex("UPDATE users SET points=MAX(0,points+?) WHERE id=?", (n, s["uid"]))
+        ex("UPDATE users SET points=CASE WHEN points+?<0 THEN 0 ELSE points+? END WHERE id=?", (n, n, s["uid"]))
     clrst(ctx)
     r = get_user(s["uid"])
     await say(update, "✅ Bajarildi\n\n" + ucard(r), ukb(r))
@@ -1540,7 +1633,7 @@ async def cb_ap(update, ctx, a):
         setst(ctx, "adm_promo")
         return await aedit(update, "🎁 Format: <code>KOD MIQDOR LIMIT KUN</code>\nMasalan: <code>FF2026 10 100 7</code>\n"
                                    "(LIMIT 0 = cheksiz, KUN 0 = muddatsiz)", IM([back("ap:l")]))
-    ps = rows("SELECT * FROM promos ORDER BY rowid DESC LIMIT 30")
+    ps = rows("SELECT * FROM promos ORDER BY code LIMIT 30")
     ln = [f"<code>{esc(p['code'])}</code> — 💎{p['amount']} — {p['used']}/{p['max_uses'] or '∞'}"
           + (f" — {datetime.fromtimestamp(p['expires'], TZ):%d.%m}" if p["expires"] else "") for p in ps]
     await crud_list(update, "🎁 <b>Promo kodlar</b>", ln, [(p["code"], f"ap:del:{p['code']}") for p in ps], "ap:add")
@@ -1551,7 +1644,8 @@ async def st_adm_promo(update, ctx, s, t):
     if not m:
         return await say(update, "❌ Format: KOD MIQDOR LIMIT KUN")
     code, amt, lim, days = m.group(1).upper(), int(m.group(2)), int(m.group(3)), int(m.group(4))
-    ex("INSERT OR REPLACE INTO promos(code,amount,max_uses,used,expires) VALUES(?,?,?,0,?)",
+    ex("INSERT INTO promos(code,amount,max_uses,used,expires) VALUES(?,?,?,0,?) ON CONFLICT(code) DO UPDATE SET "
+       "amount=excluded.amount, max_uses=excluded.max_uses, used=0, expires=excluded.expires",
        (code, amt, lim, ts() + days * 86400 if days else 0))
     clrst(ctx)
     await say(update, f"✅ Promo yaratildi: <code>{esc(code)}</code>", IM([[C("🎁 Promolar", "ap:l")]]))
@@ -1701,7 +1795,7 @@ async def cb_aa(update, ctx, a):
 async def st_adm_adm(update, ctx, s, t):
     if not t.strip().isdigit():
         return await say(update, "❌ Faqat raqamli ID.")
-    ex("INSERT OR IGNORE INTO admins(id) VALUES(?)", (int(t),))
+    ex("INSERT INTO admins(id) VALUES(?) ON CONFLICT DO NOTHING", (int(t),))
     clrst(ctx)
     await say(update, "✅ Admin qo'shildi", IM([[C("🛡 Adminlar", "aa:l")]]))
 
@@ -1909,6 +2003,9 @@ async def backup_loop(app):
 
 
 async def post_init(app):
+    if IS_PG:
+        log.info("Postgres (Neon) ishlatilmoqda — ma'lumotlar doimiy.")
+        return
     if not BACKUP_CHAT:
         log.warning("BACKUP_CHAT berilmagan — redeployda baza o'chadi!")
         return
