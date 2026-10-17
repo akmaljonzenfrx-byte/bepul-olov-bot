@@ -1839,7 +1839,14 @@ def main():
     connect()
     threading.Thread(target=run_web, daemon=True).start()
     threading.Thread(target=keepalive, daemon=True).start()
-    app = Application.builder().token(BOT_TOKEN).build()
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+    app = (Application.builder().token(BOT_TOKEN)
+           .connect_timeout(30).read_timeout(30).write_timeout(30).pool_timeout(30)
+           .get_updates_connect_timeout(30).get_updates_read_timeout(30)
+           .get_updates_write_timeout(30).get_updates_pool_timeout(30).build())
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", admin_cmd))
     app.add_handler(CommandHandler("menu", menu_cmd))
