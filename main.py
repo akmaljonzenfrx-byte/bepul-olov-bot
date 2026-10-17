@@ -1833,6 +1833,93 @@ def keepalive():
             pass
 
 
+# ───────────────────────── AVTO-BACKUP (Telegram kanal) ─────────────────────────
+BACKUP_CHAT = os.getenv("BACKUP_CHAT", "").strip()
+_bk = {"ok": False, "changes": -1, "msg": None}
+
+
+def _bcid():
+    return int(BACKUP_CHAT) if BACKUP_CHAT.lstrip("-").isdigit() else BACKUP_CHAT
+
+
+async def make_backup(bot, force=False):
+    if not BACKUP_CHAT or not _bk["ok"]:
+        return
+    ch = db.total_changes
+    if not force and ch == _bk["changes"]:
+        return
+    path = tempfile.mktemp(suffix=".db")
+    try:
+        dst = sqlite3.connect(path)
+        db.backup(dst)
+        dst.close()
+        with open(path, "rb") as f:
+            m = await bot.send_document(_bcid(), f, filename=f"backup_{now():%Y%m%d_%H%M}.db",
+                                        caption="💾 Avto-backup", disable_notification=True)
+        try:
+            await bot.pin_chat_message(_bcid(), m.message_id, disable_notification=True)
+        except Exception as e:
+            log.warning("pin xatosi (botga pin huquqi bering): %s", e)
+        if _bk["msg"]:
+            try:
+                await bot.delete_message(_bcid(), _bk["msg"])
+            except Exception:
+                pass
+        _bk.update(changes=ch, msg=m.message_id)
+    except Exception as e:
+        log.warning("backup xatosi: %s", e)
+    finally:
+        if os.path.exists(path):
+            os.remove(path)
+
+
+async def try_restore(bot):
+    """True = tayyor (tiklandi yoki backup yo'q). False = xato, qayta uriniladi."""
+    try:
+        chat = await bot.get_chat(_bcid())
+        pm = chat.pinned_message
+        if not pm or not pm.document:
+            return True
+        if one("SELECT COUNT(*) FROM users")[0] > 0:
+            _bk["msg"] = pm.message_id
+            return True
+        tmp = DB_PATH + ".new"
+        f = await pm.document.get_file()
+        await f.download_to_drive(tmp)
+        t = sqlite3.connect(tmp)
+        t.execute("SELECT COUNT(*) FROM users")
+        t.close()
+        db.close()
+        shutil.move(tmp, DB_PATH)
+        connect()
+        _bk["msg"] = pm.message_id
+        log.info("Baza Telegram backupdan tiklandi")
+        return True
+    except Exception as e:
+        log.warning("restore xatosi: %s", e)
+        return False
+
+
+async def backup_loop(app):
+    while True:
+        if not _bk["ok"]:
+            _bk["ok"] = await try_restore(app.bot)
+        await make_backup(app.bot)
+        await asyncio.sleep(300)
+
+
+async def post_init(app):
+    if not BACKUP_CHAT:
+        log.warning("BACKUP_CHAT berilmagan — redeployda baza o'chadi!")
+        return
+    _bk["ok"] = await try_restore(app.bot)
+    app.bot_data["bk_task"] = asyncio.create_task(backup_loop(app))
+
+
+async def post_stop(app):
+    await make_backup(app.bot, force=True)
+
+
 def main():
     if not BOT_TOKEN:
         raise SystemExit("BOT_TOKEN topilmadi!")
@@ -1846,7 +1933,8 @@ def main():
     app = (Application.builder().token(BOT_TOKEN)
            .connect_timeout(30).read_timeout(30).write_timeout(30).pool_timeout(30)
            .get_updates_connect_timeout(30).get_updates_read_timeout(30)
-           .get_updates_write_timeout(30).get_updates_pool_timeout(30).build())
+           .get_updates_write_timeout(30).get_updates_pool_timeout(30)
+           .post_init(post_init).post_stop(post_stop).build())
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", admin_cmd))
     app.add_handler(CommandHandler("menu", menu_cmd))
